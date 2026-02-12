@@ -1,0 +1,19 @@
+[project]
+name = "llm-engineering"
+version = "0.1.0"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "streamlit",
+  "langchain",
+  "langchain-community",
+  "langchain-experimental",
+  "langchain-google-genai",
+  "chromadb==0.4.24",
+  "numpy>=1.26.4",
+  "ollama",
+  "rapidocr-onnxruntime",
+  "ragas",
+  "datasets",
+  "pandas",
+  "pymupdf"
+]
