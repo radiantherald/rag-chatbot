@@ -461,10 +461,10 @@ def load_documents(uploaded_files, vlm_model="ministral-3b", ocr_model=None, sca
         
         try:
             if file_ext == '.pdf':
-                use_ocr_mode = scanned_pdf_mode in ["OCR only", "OCR + VLM hybrid"]
+                use_native_text = scanned_pdf_mode in ["Text only", "VLM only"]
 
                 # 1. Text Extraction
-                if not use_ocr_mode:
+                if use_native_text:
                     loader = PyPDFLoader(tmp_file_path)
                     docs = loader.load()
                     for doc in docs:
@@ -481,7 +481,9 @@ def load_documents(uploaded_files, vlm_model="ministral-3b", ocr_model=None, sca
                     run_ocr = scanned_pdf_mode in ["OCR only", "OCR + VLM hybrid"]
                     run_vlm = False
 
-                    if scanned_pdf_mode == "VLM only":
+                    if scanned_pdf_mode == "Text only":
+                        continue
+                    elif scanned_pdf_mode == "VLM only":
                         run_vlm = has_embedded_images
                     elif scanned_pdf_mode == "OCR + VLM hybrid":
                         run_vlm = True
@@ -1538,9 +1540,9 @@ def main():
         
         processing_mode = st.selectbox(
             "Scanned PDF Processing Mode",
-            ["VLM only", "OCR only", "OCR + VLM hybrid"],
-            index=2,
-            help="Choose how scanned PDF pages should be processed."
+            ["Text only", "VLM only", "OCR only", "OCR + VLM hybrid"],
+            index=0,
+            help="Choose how PDFs should be processed: native text only, text plus visual augmentation, OCR, or OCR plus VLM."
         )
 
         ocr_models = [m for m in chat_models if "ocr" in m.lower()]
