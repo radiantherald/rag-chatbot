@@ -1,4 +1,5 @@
 import os
+os.environ["DEEPEVAL_TELEMETRY_OPT_OUT"] = "YES"
 import json
 import logging
 import csv
@@ -315,11 +316,47 @@ if DEEPEVAL_AVAILABLE:
                     
                     reasoning = "Clean pass."
                     if not r["passed_all"]:
-                        for k, v in m.items():
-                            if not v.get("passed", True):
-                                reasoning = v.get("reasoning", "")[:60].replace("\n", " ") + "..."
-                                break
+                        failed_reasons = []
+                        for metric_name, metric_data in m.items():
+                            if not metric_data.get("passed", True):
+                                full_reason = metric_data.get("reasoning", "No reason provided.")
+                                clean_reason = full_reason.replace("\n", " ") 
+                                failed_reasons.append(f"[{metric_name.upper()}]: {clean_reason}")
+                        reasoning = " | ".join(failed_reasons)
                     writer.writerow([r["query"], "PASS" if r["passed_all"] else "FAIL", time_sec, cache, f_score, r_score, p_score, reasoning])
+        def print_diagnostic_summary(self):
+            if not self.results: return
+            print("\n" + "="*50 + "\n🧠 AI DIAGNOSTIC ENGINE INITIALIZING...\n" + "="*50)
+
+            failures = []
+            for r in self.results:
+                if not r["passed_all"]:
+                    issue_desc = f"Question: {r['query']}\n"
+                    for metric_name, metric_data in r.get("metrics", {}).items():
+                        if not metric_data.get("passed", True):
+                            issue_desc += f" - Failed {metric_name.upper()} (Score: {metric_data.get('score')}): {metric_data.get('reasoning')}\n"
+                    failures.append(issue_desc)
+
+            if not failures:
+                print("🟢 SYSTEM HEALTHY: The Judge found no errors. Your RAG pipeline is perfect!\n" + "="*50)
+                return
+
+            print(f"⏳ Analyzing {len(failures)} failed queries to determine root causes...\n")
+            
+            diagnostic_prompt = f"""
+            You are a Senior AI Architect debugging a RAG pipeline (Chroma DB, Llama 3.2 Generator, Optional Re-ranker).
+            Below is an error report showing failed questions and exact reasons.
+            ERROR REPORT:\n{"\n".join(failures)}
+            TASK: Analyze these failures and write a highly actionable diagnostic report. Tell the developer EXACTLY which architectural parameters (Top-K, Chunking, Temperature, Prompting, Re-ranker) to change in their code. Be direct and technical.
+            """
+
+            try:
+                action_plan = self.judge.generate(diagnostic_prompt)
+                print("🩺 --- AI JUDGE ARCHITECTURAL RECOMMENDATIONS ---")
+                print(action_plan.strip())
+            except Exception as e:
+                print(f"❌ Failed to generate AI diagnostic: {e}")
+            print("\n" + "="*50)
 
 else:
     class RAGEvaluator: pass
@@ -421,6 +458,7 @@ if __name__ == "__main__":
             print(f"\nFound {len(test_cases)} queries in the log file. Grading now...\n")
             evaluator.batch_evaluate(test_cases)
             evaluator.export_report("validation_report.csv")
+            evaluator.print_diagnostic_summary()
             print("✅ Grading Complete! Check validation_report.csv")
 
     elif choice == "3":  # <--- NEW LOGIC FOR OPTION 3
