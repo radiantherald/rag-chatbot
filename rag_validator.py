@@ -344,12 +344,23 @@ if DEEPEVAL_AVAILABLE:
             print(f"⏳ Analyzing {len(failures)} failed queries to determine root causes...\n")
             
             diagnostic_prompt = f"""
-            You are a Senior AI Architect debugging a RAG pipeline (Chroma DB, Llama 3.2 Generator, Optional Re-ranker).
-            Below is an error report showing failed questions and exact reasons.
-            ERROR REPORT:\n{"\n".join(failures)}
-            TASK: Analyze these failures and write a highly actionable diagnostic report. Tell the developer EXACTLY which architectural parameters (Top-K, Chunking, Temperature, Prompting, Re-ranker) to change in their code. Be direct and technical.
-            """
+            You are an elite AI Systems Engineer diagnosing a Python Streamlit RAG application.
+            Architecture: Chroma DB (Vector), Llama 3.2 (Generator LLM), optional Cross-Encoder Re-ranker.
 
+            Here are the specific metric failures and reasoning from the latest DeepEval test run:
+            --- ERROR LOGS ---
+            {"\n".join(failures)}
+            ------------------
+
+            TASK:
+            Based on the errors above, provide a strict, bulleted ACTION PLAN on exactly what parameters the developer must change in their bot's code.
+            Structure your response strictly into these categories:
+            1. 🔍 RETRIEVAL FIXES (e.g., Increase Top-K `k` value, Chunk Size, enable Re-ranker, change chunk overlap).
+            2. ✍️ GENERATION FIXES (e.g., Lower LLM Temperature, inject specific anti-hallucination rules into the system prompt).
+            3. 🎯 INTENT FIXES (e.g., Improve Standalone Question re-writer prompt).
+
+            Do not write generic apologies or summaries. Be highly technical, direct, and specify the exact parameters to tune based on the exact errors provided.
+            """
             try:
                 action_plan = self.judge.generate(diagnostic_prompt)
                 print("🩺 --- AI JUDGE ARCHITECTURAL RECOMMENDATIONS ---")
@@ -386,23 +397,35 @@ def run_data_loss_audit(db_path: str, embed_model_name: str, raw_file_path: str)
         vectorstore = Chroma(persist_directory=db_path, embedding_function=embeddings)
         db_data = vectorstore.get()
         
-        total_chunks = len(db_data.get("ids", []))
-        total_characters = sum(len(doc) for doc in db_data.get("documents", []))
+        target_filename = os.path.basename(raw_file_path) if raw_file_path else ""
+        total_chunks_in_db = len(db_data.get("ids", []))
         unique_sources = {os.path.basename(meta["source"]) for meta in db_data.get("metadatas", []) if meta and "source" in meta}
+
+        # Filter the database to ONLY count chunks from the specific file
+        file_specific_characters = 0
+        file_specific_chunks = 0
+        for i, meta in enumerate(db_data.get("metadatas", [])):
+            if meta and "source" in meta and os.path.basename(meta["source"]) == target_filename:
+                file_specific_characters += len(db_data["documents"][i])
+                file_specific_chunks += 1
 
         print("-" * 50)
         print("📊 INTEGRITY METRICS:")
         print("-" * 50)
         if raw_characters > 0:
-            print(f"📄 Raw File Characters:      {raw_characters:,}")
-            print(f"💾 Database Characters:      {total_characters:,}")
-            if total_characters >= raw_characters:
-                print("✅ DATA LOSS CHECK:          PASS (100% of data is in the DB)")
+            print(f"🎯 Target File:               {target_filename}")
+            print(f"📄 Raw File Characters:       {raw_characters:,}")
+            print(f"💾 DB Characters (This file): {file_specific_characters:,}")
+            print(f"🧩 DB Chunks (This file):     {file_specific_chunks:,}")
+            
+            # Use a 95% threshold to account for LangChain stripping invisible formatting/spaces
+            if file_specific_characters >= (raw_characters * 0.95):
+                print("✅ DATA LOSS CHECK:          PASS (Data is fully embedded)")
             else:
-                print("❌ DATA LOSS CHECK:          FAIL (Database is missing data!)")
+                print("❌ DATA LOSS CHECK:          FAIL (Database is missing data for this file!)")
             print("-" * 50)
 
-        print(f"✅ Total Chunks Stored:      {total_chunks:,}")
+        print(f"✅ Total Chunks Stored:      {total_chunks_in_db:,}")
         print(f"✅ Unique Files Found:       {len(unique_sources)}")
         for source in unique_sources: 
             print(f"   📄 -> {source}")
@@ -458,7 +481,7 @@ if __name__ == "__main__":
             print(f"\nFound {len(test_cases)} queries in the log file. Grading now...\n")
             evaluator.batch_evaluate(test_cases)
             evaluator.export_report("validation_report.csv")
-            evaluator.print_diagnostic_summary()
+            evaluator.print_diagnostic_summpromptary()
             print("✅ Grading Complete! Check validation_report.csv")
 
     elif choice == "3":  # <--- NEW LOGIC FOR OPTION 3
