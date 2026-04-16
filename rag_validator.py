@@ -481,7 +481,7 @@ if __name__ == "__main__":
             print(f"\nFound {len(test_cases)} queries in the log file. Grading now...\n")
             evaluator.batch_evaluate(test_cases)
             evaluator.export_report("validation_report.csv")
-            evaluator.print_diagnostic_summpromptary()
+            evaluator.print_diagnostic_summary()
             print("✅ Grading Complete! Check validation_report.csv")
 
     elif choice == "3":  # <--- NEW LOGIC FOR OPTION 3
