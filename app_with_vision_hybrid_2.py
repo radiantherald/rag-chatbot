@@ -1530,27 +1530,6 @@ def check_retrieval_grounding(vectorstore, question, search_kwargs=None):
             "scored_results": [],
         }
 
-    # Some Chroma/LangChain combinations return zeroed or near-zero relevance scores
-    # even when retrieval is healthy. This happens when hnsw:space="cosine" causes
-    # LangChain to return the raw cosine distance (0=similar) instead of relevance (1=similar).
-    # We detect this by checking if ALL scores are suspiciously below 0.005 and fall back.
-    if scored_results:
-        provisional_scores = [max(0.0, min(1.0, float(score))) for _, score in scored_results]
-        if max(provisional_scores) <= 0.005:
-            try:
-                distance_results = vectorstore.similarity_search_with_score(
-                    question,
-                    **similarity_kwargs
-                )
-                distance_space = get_vectorstore_distance_space(vectorstore)
-                scored_results = [
-                    (doc, distance_to_relevance(distance, distance_space), float(distance))
-                    for doc, distance in distance_results
-                ]
-                score_mode = f"distance_fallback:{distance_space}"
-            except Exception as distance_error:
-                print(f"Retrieval guard distance fallback skipped: {distance_error}")
-
     if not scored_results:
         return {
             "allow_answer": False,
@@ -2930,6 +2909,7 @@ def main():
                                 "description_length": len(st.session_state.temp_image_desc),
                             })
                         
+                        has_document_tag = False    
                         if "@" in user_input:
                             try:
                                 # Use cached sources
@@ -2938,28 +2918,28 @@ def main():
                                 words = user_input.split()
                                 for word in words:
                                     if word.startswith("@") and len(word) > 1:
+                                        has_document_tag = True
                                         ref = word[1:]
-                                        # Always strip the @mention from the question text
-                                        # so cache lookups and LLM prompts don't include it
+                                        # Unconditionally strip the mention so it doesn't leak into cache/prompts
                                         clean_input = clean_input.replace(word, "").strip()
 
-                                        # Also try to match the mention to a document source filter
-                                        for source in available_sources:
-                                            if ref.lower() in source.lower():
-                                                matched_source = source
-                                                break
-                                        
-                                        if matched_source:
-                                            search_kwargs = {'filter': {'source': matched_source}}
-                                            st.caption(f"🔒 Filtering by document: `{matched_source}`")
-                                            query_trace.append({
-                                                "step": "source_filter_applied",
-                                                "matched_source": matched_source,
-                                                "raw_reference": word,
-                                            })
-                                        else:
-                                            st.caption(f"⚠️ `{word}` not matched to any known source — stripped from query.")
-                                        break
+                                        # Only map the first matched source filter to ChromaDB
+                                        if not matched_source:
+                                            for source in available_sources:
+                                                if ref.lower() in source.lower():
+                                                    matched_source = source
+                                                    break
+                                            
+                                            if matched_source:
+                                                search_kwargs = {'filter': {'source': matched_source}}
+                                                st.caption(f"🔒 Filtering by document: `{matched_source}`")
+                                                query_trace.append({
+                                                    "step": "source_filter_applied",
+                                                    "matched_source": matched_source,
+                                                    "raw_reference": word,
+                                                })
+                                            else:
+                                                st.caption(f"⚠️ `{word}` not matched to any known source — stripped from query.")
                             except Exception as e:
                                 st.error(f"Error parsing Reference: {e}")
                                 query_trace.append({
@@ -3010,10 +2990,10 @@ def main():
                             query_trace.append({
                                 "step": "tabular_analytics_selected",
                             })
-                        elif st.session_state.semantic_cache and len(clean_input) > 15 and not matched_source:
+                        elif st.session_state.semantic_cache and len(clean_input) > 15 and not has_document_tag:
                             # 15 chars is roughly 3-4 words. e.g. "What is RTA?"
-                            # Skip cache when a @mention source filter is active:
-                            # two queries like "summarize @nbbl" and "summarize @ppac" produce
+                            # Skip cache when a @mention source filter is present:
+                            # two queries like "summarize @doc1" and "summarize @doc2" produce
                             # the same clean_input after stripping, so they must not share a cache entry.
                             cached_answer, cache_distance, cache_id = st.session_state.semantic_cache.lookup(clean_input, threshold=0.80)
                             query_trace.append({
@@ -3045,7 +3025,7 @@ def main():
                                     "step": "tabular_analytics_answered",
                                     "hit": bool(cached_answer),
                                 })
-                            elif st.session_state.semantic_cache and not matched_source:
+                            elif st.session_state.semantic_cache and not has_document_tag:
                                 # Also skip cache for @mention source-filtered queries
                                 cached_answer, cache_distance, cache_id = st.session_state.semantic_cache.lookup(standalone_question, threshold=0.80)
                                 query_trace.append({
@@ -3063,7 +3043,7 @@ def main():
                             else:
                                 st.write(f"**Standalone Question:** `{standalone_question}`")
                             
-                            st.write(f"**Cache Distance:** {cache_distance:.4f} (Threshold: {'< 0.05' if optimistic_hit else '< 0.20'})")
+                            st.write(f"**Cache Distance:** {cache_distance:.4f} (Threshold: `< 0.20`)")
                             
                             if cached_answer:
                                 st.success("Hit! ⚡")
