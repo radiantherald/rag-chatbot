@@ -185,16 +185,28 @@ def get_ollama_models():
         print(f"Error fetching models: {e}")
         return ["ministral-3b", "qwen3-vl:4b", "deepseek-ocr:latest", "nomic-embed-text:latest", "llama3.2:3b"]
 
+def clean_thinking_tags(text):
+    """
+    Removes DeepSeek-style <think>...</think> reasoning blocks from text.
+    Handles unclosed tags as well as hallucinated closing tags (e.g. <channel|>).
+    """
+    import re
+    # Match any XML-like tag to act as a thought-closer, even poorly formed ones
+    cleaned = re.sub(r'<think>(.*?)(?:</?[a-zA-Z_:-][^>]*>|$)', '', text, flags=re.DOTALL)
+    return cleaned.strip()
+
 def clean_history(history):
     """
     Removes the appended 'Time taken' and 'Sources' from AIMessages 
-    so the LLM doesn't learn to hallucinate them.
+    so the LLM doesn't learn to hallucinate them. Also strips internal <think> blocks.
     """
     cleaned = []
     for msg in history:
         if isinstance(msg, AIMessage):
             # Split by the specific marker we use to remove appended stats
             content = msg.content.split("\n\n**Time taken:")[0]
+            # Strip out deep reasoning blocks so they don't pollute future prompts
+            content = clean_thinking_tags(content)
             cleaned.append(AIMessage(content=content))
         else:
             cleaned.append(msg)
@@ -547,7 +559,63 @@ def create_embedding_function(embedding_model_name, local_only=False):
                 "Make sure `sentence-transformers` is installed and the model can be loaded."
             ) from embedding_error
 
-    return OllamaEmbeddings(model=embedding_model_name, base_url=OLLAMA_HOST)
+    from langchain_core.embeddings import Embeddings
+
+    class CustomOllamaAPIEmbeddings(Embeddings):
+        """
+        Bypasses LangChain's native Ollama wrapper to safely communicate with 
+        Ollama's /api/embed endpoint. Allows us to explicitly send truncate=True
+        and extend num_ctx to prevent HTTP 500 crashes on models like mxbai-embed-large.
+        """
+        def __init__(self, model_name, base_url):
+            self.model_name = model_name
+            self.base_url = base_url.rstrip("/")
+
+        def _embed_batch(self, texts):
+            payload = {
+                "model": self.model_name,
+                "input": texts,
+                "truncate": True,  # Officially tells Ollama to truncate tokens to model limit
+                "options": {
+                    "num_ctx": 8192  # Expand the context buffer memory
+                }
+            }
+            session = get_local_http_session()
+            try:
+                # Modern Ollama endpoint (v0.1.30+)
+                resp = session.post(f"{self.base_url}/api/embed", json=payload)
+                resp.raise_for_status()
+                return resp.json().get("embeddings", [])
+            except requests.exceptions.HTTPError as ext:
+                if "404" in str(ext) or "400" in str(ext):
+                    # Fallback to legacy endpoint if Ollama is old or rejects the modern payload
+                    embeddings = []
+                    for text in texts:
+                        # Fallback manual slice since legacy doesn't support truncate=True well
+                        safe_text = text[:1000]
+                        legacy_payload = {
+                            "model": self.model_name,
+                            "prompt": safe_text,
+                            "options": {"num_ctx": 8192}
+                        }
+                        r = session.post(f"{self.base_url}/api/embeddings", json=legacy_payload)
+                        r.raise_for_status()
+                        embeddings.append(r.json().get("embedding", []))
+                    return embeddings
+                raise
+
+        def embed_documents(self, texts):
+            # Batch in smaller chunks of 15 strings at a time to avoid HTTP timeout limits
+            all_embeddings = []
+            for i in range(0, len(texts), 15):
+                batch = texts[i:i+15]
+                all_embeddings.extend(self._embed_batch(batch))
+            return all_embeddings
+
+        def embed_query(self, text):
+            return self._embed_batch([text])[0]
+
+    return CustomOllamaAPIEmbeddings(embedding_model_name, OLLAMA_HOST)
 
 def run_vision_prompt(image_bytes, model_name, prompt, timeout=(10, 1800)):
     """Runs a local Ollama multimodal request with proxy bypass and base64-encoded image bytes."""
@@ -1384,13 +1452,6 @@ def get_standalone_question(user_input, chat_history, llm_model_name):
 
     User Input: how do I bake a cake?
     Result: how do I bake a cake?
-
-    Chat History:
-    Human: Describe this image
-    AI: The image shows a flowchart for the Rutabara arc widgets framework.
-
-    User Input: what is rutabara?
-    Result: what is rutabara?
     """
     
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
@@ -1441,14 +1502,14 @@ def get_retrieval_guard_thresholds(question):
 
     if is_summary_task:
         return {
-            "min_top_score": 0.70,
-            "min_avg_score": 0.60,
+            "min_top_score": 0.10,
+            "min_avg_score": 0.05,
             "score_sample_k": 4,
         }
 
     return {
-        "min_top_score": 0.80,
-        "min_avg_score": 0.70,
+        "min_top_score": 0.20,
+        "min_avg_score": 0.10,
         "score_sample_k": 3,
     }
 
@@ -1612,16 +1673,23 @@ def get_rag_chain_standard(vectorstore, model_name, search_kwargs=None, use_rera
 
     st.session_state.reranker_status = reranker_status
     
-    qa_system_prompt = """You are an assistant for question-answering tasks. 
-    Use the following pieces of retrieved context to answer the question. 
-    If you don't know the answer, just say that you don't know. 
+    qa_system_prompt = """You are a highly analytical expert assistant. Your task is to answer the user's question by deeply reasoning through the provided context.
+
+    DEEP THINKING INSTRUCTIONS:
+    1. Read the provided context carefully. There may be multiple disjointed pieces of information that you must connect to form a cohesive answer.
+    2. Before answering, you MUST "think out loud" about how the given facts relate to the user's question. You must place all of your thoughts and reasoning inside <think> and </think> tags.
+    3. If the question requires inference, connect the dots logically based ONLY on the evidence provided inside your <think> tags. 
+    4. If the provided context simply does not contain enough information to deduce a complete answer, do NOT just say "I don't know". Instead, explain exactly what part of the question can be answered, and clearly state what specific information is missing from the context.
     
-    IMPORTANT: You may receive descriptions of images as context. Treat these descriptions as factual observations of the visual content.
+    IMPORTANT DETAILS:
+    - You must output your thinking process wrapped in <think>...</think> FIRST, before your final answer.
+    - You may receive descriptions of images as context. Treat these descriptions as factual observations of the visual content.
+    - Answer the question comprehensively and thoughtfully, but do not hallucinate outside knowledge in your final answer.
+    - Do NOT include "Time taken" or "Sources" in your answer. These are added automatically by the system.
     
-    Use as much detail as necessary to answer the question comfortably. But answer the question to the point, do not include additional information just because it is there.
-    Do NOT include "Time taken" or "Sources" in your answer. These are added automatically.
-    
-    {context}"""
+    <context>
+    {context}
+    </context>"""
     
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system", qa_system_prompt + "\n\nFormatting requirement:\n{response_style}"),
@@ -2157,13 +2225,10 @@ def main():
         
         st.divider()
         
-        # New Chat Button
         if st.button("🆕 New Chat", type="primary", use_container_width=True):
             st.session_state.chat_history = []
-            st.session_state.unique_sources = []
             st.session_state.processing_time = 0
-            st.session_state.processed_images = [] # Clear debugging images
-            st.session_state.processing_debug_summaries = []
+            st.session_state.show_feedback_box = None
             st.session_state.show_feedback_box = None
             
             # Clear Temporary Session Image
@@ -2225,7 +2290,22 @@ def main():
             ["nomic-embed-text"],
             DEFAULT_NOMIC_EMBED_MODEL
         )
-        embed_models = ["all-MiniLM-L6-v2", resolved_nomic_model]
+        # Dynamically find installed embedding models from Ollama
+        dynamic_embeds = [
+            m for m in ollama_models 
+            if any(kw in m.lower() for kw in ["embed", "bge", "mxbai", "m3", "minilm"])
+        ]
+        
+        embed_models = []
+        # Add default hardcoded ones first
+        for m_name in ["all-MiniLM-L6-v2", resolved_nomic_model]:
+            if m_name not in embed_models:
+                embed_models.append(m_name)
+        
+        # Append any new ones pulled in Ollama
+        for m_name in dynamic_embeds:
+            if m_name not in embed_models:
+                embed_models.append(m_name)
 
         selected_embed_model = st.selectbox(
             "Select Embedding Model",
@@ -2785,7 +2865,29 @@ def main():
                 st.markdown(message.content)
         elif isinstance(message, AIMessage):
             with st.chat_message("assistant"):
-                st.markdown(message.content)
+                content = message.content
+                if "<think>" in content:
+                    import re
+                    # Close the thought block at ANY tag-like sequence
+                    match = re.search(r'<think>(.*?)(?:</?[a-zA-Z_:-][^>]*>|$)', content, flags=re.DOTALL)
+                    if match:
+                        think_text = match.group(1).strip()
+                        answer_text = content[match.end():].strip()
+                        
+                        # Handle the case where the stream completely ended without emitting a closing tag
+                        if answer_text or re.search(r'</?[a-zA-Z_:-][^>]*>', content[match.end(1):]):
+                            with st.status("🤖 AI Thought Process", expanded=False, state="complete"):
+                                st.markdown(think_text)
+                        else:
+                            with st.status("🤖 AI Thought Process (Incomplete)", expanded=False, state="complete"):
+                                st.markdown(think_text)
+                                
+                        if answer_text:
+                            st.markdown(answer_text)
+                    else:
+                        st.markdown(content)
+                else:
+                    st.markdown(content)
                 
                 # Button Column
                 col_actions, _ = st.columns([2, 5])
@@ -2877,7 +2979,7 @@ def main():
                 st.warning("Please upload and process documents first to enable RAG, or upload a temporary image.")
         else:
             with st.chat_message("assistant"):
-                message_placeholder = st.empty()
+                message_placeholder = st.container()
                 with st.spinner("Thinking..."):
                     try:
                         # Logic to handle @ referencing
@@ -3240,21 +3342,82 @@ def main():
                                     
                                     full_answer = ""
                                     context = []
+                                    think_content = ""
+                                    in_think_block = False
                                     
+                                    # Create placeholders for UI
+                                    thought_expander = message_placeholder.status("🤖 AI Thought Process...", expanded=True)
+                                    thought_placeholder = thought_expander.empty()
+                                    answer_placeholder = message_placeholder.empty()
+
                                     # Stream the response
+                                    has_thought_trace = False
+                                    thought_rendered = False
+                                    thought_end_idx = -1
+                                    
                                     for chunk in chain.stream({
                                         "input": standalone_question,
                                         "response_style": response_style
                                     }):
                                         if "answer" in chunk:
-                                            full_answer += chunk["answer"]
-                                            message_placeholder.markdown(full_answer + "▌")
+                                            text_chunk = chunk["answer"]
+                                            full_answer += text_chunk
+                                            
+                                            if "<think>" in full_answer:
+                                                has_thought_trace = True
+                                                start_idx = full_answer.find("<think>") + 7
+                                                
+                                                if not thought_rendered:
+                                                    import re
+                                                    thought_so_far = full_answer[start_idx:]
+                                                    # Extremely flexible XML tag catcher
+                                                    match = re.search(r'</?[a-zA-Z_:-][^>]*>', thought_so_far)
+                                                    
+                                                    if match:
+                                                        thought_end_offset = match.start()
+                                                        tag_end_offset = match.end()
+                                                        
+                                                        think_content = thought_so_far[:thought_end_offset].strip()
+                                                        thought_placeholder.markdown(think_content)
+                                                        thought_expander.update(label="🤖 AI Thought Process", expanded=False, state="complete")
+                                                        thought_rendered = True
+                                                        
+                                                        # Save where the actual answer resumes
+                                                        thought_end_idx = start_idx + tag_end_offset
+                                                        
+                                                        visible_text = full_answer[thought_end_idx:].lstrip()
+                                                        if visible_text:
+                                                            answer_placeholder.markdown(visible_text + "▌")
+                                                    else:
+                                                        # Still actively generating thoughts
+                                                        thought_placeholder.markdown(thought_so_far.strip() + "▌")
+                                                else:
+                                                    # Thought block is completely bypassed, map direct to answer
+                                                    visible_text = full_answer[thought_end_idx:].lstrip()
+                                                    answer_placeholder.markdown(visible_text + "▌")
+                                            else:
+                                                # Pre-thinking or refusing to think (standard streaming)
+                                                answer_placeholder.markdown(full_answer + "▌")
                                         
                                         if "context" in chunk:
                                             context = chunk["context"]
         
-                                    # Final update to remove cursor
-                                    message_placeholder.markdown(full_answer)
+                                    # Final update to clean up cursors
+                                    if not has_thought_trace:
+                                        thought_expander.update(label="No reasoning trace", expanded=False, state="complete")
+                                        thought_placeholder.empty()
+                                        answer_placeholder.markdown(full_answer)
+                                    else:
+                                        if not thought_rendered:
+                                            # Edge case: It started thinking but never closed the tag before stream ended
+                                            thought_expander.update(label="🤖 AI Thought Process (Incomplete)", expanded=False, state="complete")
+                                            # Nothing visible to print safely because we don't know where the thought ends
+                                            final_visible_text = ""
+                                        else:
+                                            final_visible_text = full_answer[thought_end_idx:].strip()
+                                            
+                                        if final_visible_text:
+                                            answer_placeholder.markdown(final_visible_text)
                                     
                                     # Reconstruct response object for downstream logic
                                     response = {
@@ -3275,14 +3438,15 @@ def main():
                                 chain = prompt | llm | StrOutputParser()
                                 
                                 full_answer = ""
+                                direct_placeholder = message_placeholder.empty()
                                 for chunk in chain.stream({
                                     "input": standalone_question,
                                     "response_style": response_style
                                 }):
                                     full_answer += chunk
-                                    message_placeholder.markdown(full_answer + "▌")
+                                    direct_placeholder.markdown(full_answer + "▌")
                                 
-                                message_placeholder.markdown(full_answer)
+                                direct_placeholder.markdown(full_answer)
                                 
                                 response = {
                                     "answer": full_answer,
