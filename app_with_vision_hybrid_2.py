@@ -2866,6 +2866,13 @@ def main():
         elif isinstance(message, AIMessage):
             with st.chat_message("assistant"):
                 content = message.content
+                system_footer = ""
+                # Strip out system-appended text to prevent it from being swallowed by greedy regex
+                if "\n\n**Time taken:**" in content:
+                    parts = content.split("\n\n**Time taken:**", 1)
+                    content = parts[0]
+                    system_footer = "\n\n**Time taken:**" + parts[1]
+                    
                 if "<think>" in content:
                     import re
                     # Close the thought block at ANY tag-like sequence
@@ -2883,11 +2890,14 @@ def main():
                                 st.markdown(think_text)
                                 
                         if answer_text:
-                            st.markdown(answer_text)
+                            st.markdown(answer_text + system_footer)
+                        else:
+                            if system_footer:
+                                st.markdown(system_footer.strip())
                     else:
-                        st.markdown(content)
+                        st.markdown(content + system_footer)
                 else:
-                    st.markdown(content)
+                    st.markdown(content + system_footer)
                 
                 # Button Column
                 col_actions, _ = st.columns([2, 5])
@@ -3438,15 +3448,65 @@ def main():
                                 chain = prompt | llm | StrOutputParser()
                                 
                                 full_answer = ""
-                                direct_placeholder = message_placeholder.empty()
+                                thought_expander = message_placeholder.status("🤖 AI Thought Process...", expanded=True)
+                                thought_placeholder = thought_expander.empty()
+                                answer_placeholder = message_placeholder.empty()
+                                
+                                has_thought_trace = False
+                                thought_rendered = False
+                                thought_end_idx = -1
+                                
                                 for chunk in chain.stream({
                                     "input": standalone_question,
                                     "response_style": response_style
                                 }):
                                     full_answer += chunk
-                                    direct_placeholder.markdown(full_answer + "▌")
+                                    
+                                    if "<think>" in full_answer:
+                                        has_thought_trace = True
+                                        start_idx = full_answer.find("<think>") + 7
+                                        
+                                        if not thought_rendered:
+                                            import re
+                                            thought_so_far = full_answer[start_idx:]
+                                            match = re.search(r'</?[a-zA-Z_:-][^>]*>', thought_so_far)
+                                            
+                                            if match:
+                                                thought_end_offset = match.start()
+                                                tag_end_offset = match.end()
+                                                
+                                                think_content = thought_so_far[:thought_end_offset].strip()
+                                                thought_placeholder.markdown(think_content)
+                                                thought_expander.update(label="🤖 AI Thought Process", expanded=False, state="complete")
+                                                thought_rendered = True
+                                                
+                                                thought_end_idx = start_idx + tag_end_offset
+                                                
+                                                visible_text = full_answer[thought_end_idx:].lstrip()
+                                                if visible_text:
+                                                    answer_placeholder.markdown(visible_text + "▌")
+                                            else:
+                                                thought_placeholder.markdown(thought_so_far.strip() + "▌")
+                                        else:
+                                            visible_text = full_answer[thought_end_idx:].lstrip()
+                                            answer_placeholder.markdown(visible_text + "▌")
+                                    else:
+                                        answer_placeholder.markdown(full_answer + "▌")
                                 
-                                direct_placeholder.markdown(full_answer)
+                                # Final update
+                                if not has_thought_trace:
+                                    thought_expander.update(label="No reasoning trace", expanded=False, state="complete")
+                                    thought_placeholder.empty()
+                                    answer_placeholder.markdown(full_answer)
+                                else:
+                                    if not thought_rendered:
+                                        thought_expander.update(label="🤖 AI Thought Process (Incomplete)", expanded=False, state="complete")
+                                        final_visible_text = ""
+                                    else:
+                                        final_visible_text = full_answer[thought_end_idx:].strip()
+                                        
+                                    if final_visible_text:
+                                        answer_placeholder.markdown(final_visible_text)
                                 
                                 response = {
                                     "answer": full_answer,

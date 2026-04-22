@@ -132,13 +132,25 @@ def prune_event_for_prompt(event: Dict[str, Any]) -> Dict[str, Any]:
 
     if event_type == "query":
         retrieved_chunks = event.get("retrieved_chunks", [])
+        raw_answer = event.get("answer", "")
+        
+        # Dynamically separate the raw query into its internal reasoning trace and its final answer
+        import re
+        think_text = ""
+        if isinstance(raw_answer, str):
+            match = re.search(r'<think>(.*?)(?:</?[a-zA-Z_:-][^>]*>|$)', raw_answer, flags=re.DOTALL)
+            if match:
+                think_text = match.group(1).strip()
+                raw_answer = raw_answer[match.end():].strip()
+                
         base.update(
             {
                 "query_time_seconds": event.get("query_time_seconds"),
                 "question": event.get("question"),
                 "clean_input": event.get("clean_input"),
                 "standalone_question": event.get("standalone_question"),
-                "answer": truncate_text(event.get("answer"), max_chars=5000),
+                "llm_reasoning_trace": truncate_text(think_text, max_chars=4000) if think_text else None,
+                "answer": truncate_text(raw_answer, max_chars=5000),
                 "chat_model": event.get("chat_model"),
                 "embedding_model": event.get("embedding_model"),
                 "semantic_cache_hit": event.get("semantic_cache_hit"),
@@ -187,15 +199,10 @@ You are a meticulous multimodal RAG validation auditor.
 Your job is to validate one structured log event from a knowledge-base-specific log file.
 
 Important rule about chain-of-thought:
-- You do NOT have access to the model's hidden private reasoning.
-- When asked to perform chain-of-thought validation, validate ONLY the observable reasoning trace captured in the log:
-  - standalone question creation
-  - cache decisions
-  - retrieval settings
-  - grounding checks
-  - retrieved chunks
-  - final answer
-- Never claim access to hidden internal reasoning.
+- The `observable_reasoning_trace` parameter captures the application system's execution path (retrieval constraints, cache logic, chunk scoring).
+- The `llm_reasoning_trace` parameter captures the generator model's explicit <think> block internal logic. If it is null, the generator model's internal reasoning is hidden.
+- When validating chain-of-thought, evaluate both the system trace AND the LLM trace (if present). You must ensure the generator's internal reasoning correctly interprets the retrieved evidence without hallucinations.
+- Do NOT fault the `answer` if it does not contain reasoning; the reasoning is isolated in `llm_reasoning_trace`.
 
 Validate this event with emphasis on:
 - factual grounding against retrieved chunks
@@ -220,7 +227,7 @@ Return valid JSON only with this schema:
   "overall_score": 0,
 {accuracy_schema}  "risk_level": "low|medium|high|critical",
   "chain_of_thought_validation": {{
-    "scope": "observable_trace_only",
+    "scope": "observable_app_trace_only|system_and_generator_llm_reasoning",
     "trace_coherence_score": 0,
     "trace_supported_by_evidence": true,
     "missing_steps": ["..."],
