@@ -18,8 +18,15 @@ from PIL import Image
 
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain_community.chat_models import ChatOllama
+
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
+
+try:
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+except ImportError:
+    ChatOpenAI = None
+    OpenAIEmbeddings = None
 
 from langchain.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -171,6 +178,43 @@ def log_feedback(query, contexts, answer, score, text, model):
 
 init_feedback_db()
 
+def fetch_openai_models(base_url, api_key):
+    if not base_url or not api_key:
+        return []
+    import requests
+    session = requests.Session()
+    session.trust_env = False
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = f"{base_url.rstrip('/')}/models"
+    try:
+        response = session.get(url, headers=headers, timeout=(3, 10))
+        response.raise_for_status()
+        data = response.json()
+        return sorted([item["id"] for item in data.get("data", []) if item.get("id")])
+    except Exception as e:
+        print(f"Error fetching OpenAI models: {e}")
+        return []
+
+def get_chat_model(model_name, temperature=0.0):
+    """Instantiates the correct LangChain model class based on prefix."""
+    from langchain_community.chat_models import ChatOllama
+    
+    clean_model = model_name.replace("[OpenAI] ", "").replace("[Ollama] ", "")
+    if model_name.startswith("[OpenAI]"):
+        if ChatOpenAI:
+            return ChatOpenAI(
+                model=clean_model,
+                temperature=temperature,
+                openai_api_base=st.session_state.get("openai_base_url"),
+                api_key=st.session_state.get("openai_api_key") or "sk-dummy",
+                openai_api_key=st.session_state.get("openai_api_key") or "sk-dummy"
+            )
+        else:
+            raise RuntimeError("langchain_openai not installed. Cannot use OpenAI models.")
+    else:
+        return get_chat_model(clean_model, temperature=temperature)
+
+
 def get_ollama_models():
     """Fetches available Ollama models."""
     try:
@@ -187,12 +231,12 @@ def get_ollama_models():
 
 def clean_thinking_tags(text):
     """
-    Removes DeepSeek-style <think>...</think> reasoning blocks from text.
+    Removes DeepSeek-style and Gemma4-style reasoning blocks from text.
     Handles unclosed tags as well as hallucinated closing tags (e.g. <channel|>).
     """
     import re
     # Match any XML-like tag to act as a thought-closer, even poorly formed ones
-    cleaned = re.sub(r'<think>(.*?)(?:</?[a-zA-Z_:-][^>]*>|$)', '', text, flags=re.DOTALL)
+    cleaned = re.sub(r'(?:<think>|<\|channel>thought\n?)(.*?)(?:</think>|<\|channel>answer|$)', '', text, flags=re.DOTALL)
     return cleaned.strip()
 
 def clean_history(history):
@@ -561,6 +605,18 @@ def create_embedding_function(embedding_model_name, local_only=False):
 
     from langchain_core.embeddings import Embeddings
 
+    clean_model = embedding_model_name.replace("[OpenAI] ", "").replace("[Ollama] ", "")
+    if embedding_model_name.startswith("[OpenAI]"):
+        if OpenAIEmbeddings:
+            return OpenAIEmbeddings(
+                model=clean_model,
+                openai_api_base=st.session_state.get("openai_base_url"),
+                api_key=st.session_state.get("openai_api_key") or "sk-dummy",
+                openai_api_key=st.session_state.get("openai_api_key") or "sk-dummy"
+            )
+        else:
+            raise RuntimeError("langchain_openai not installed.")
+            
     class CustomOllamaAPIEmbeddings(Embeddings):
         """
         Bypasses LangChain's native Ollama wrapper to safely communicate with 
@@ -615,33 +671,66 @@ def create_embedding_function(embedding_model_name, local_only=False):
         def embed_query(self, text):
             return self._embed_batch([text])[0]
 
-    return CustomOllamaAPIEmbeddings(embedding_model_name, OLLAMA_HOST)
+    return CustomOllamaAPIEmbeddings(clean_model, OLLAMA_HOST)
 
 def run_vision_prompt(image_bytes, model_name, prompt, timeout=(10, 1800)):
-    """Runs a local Ollama multimodal request with proxy bypass and base64-encoded image bytes."""
-    payload = {
-        "model": model_name,
-        "stream": False,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-                "images": [base64.b64encode(image_bytes).decode("ascii")]
-            }
-        ]
-    }
-
-    session = get_local_http_session()
-    try:
-        response = session.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=timeout)
-        response.raise_for_status()
-        data = response.json()
-        return data["message"]["content"]
-    except requests.exceptions.ReadTimeout as timeout_error:
-        raise RuntimeError(
-            f"Ollama request timed out for model `{model_name}`. "
-            "Try OCR-only mode, a lower page render resolution, or a faster model."
-        ) from timeout_error
+    """Runs a local Ollama or OpenAI-compatible multimodal request."""
+    clean_model = model_name.replace("[OpenAI] ", "").replace("[Ollama] ", "")
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
+    
+    if model_name.startswith("[OpenAI]"):
+        base_url = st.session_state.get("openai_base_url", "").rstrip("/")
+        api_key = st.session_state.get("openai_api_key", "")
+        headers = {"Authorization": f"Bearer {api_key}"}
+        
+        payload = {
+            "model": clean_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                    ]
+                }
+            ],
+            "max_tokens": 1024
+        }
+        session = get_local_http_session()
+        try:
+            # We use standard chat/completions endpoint for OpenAI
+            url = f"{base_url}/chat/completions"
+            response = session.post(url, json=payload, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise RuntimeError(f"OpenAI vision request failed for model `{model_name}`: {e}")
+            
+    else:
+        payload = {
+            "model": clean_model,
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [b64_image]
+                }
+            ]
+        }
+    
+        session = get_local_http_session()
+        try:
+            response = session.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            return data["message"]["content"]
+        except requests.exceptions.ReadTimeout as timeout_error:
+            raise RuntimeError(
+                f"Ollama request timed out for model `{model_name}`. "
+                "Try OCR-only mode, a lower page render resolution, or a faster model."
+            ) from timeout_error
 
 def clean_extracted_text(text):
     """Normalizes extracted text while preserving basic paragraph breaks."""
@@ -782,11 +871,29 @@ def load_documents(
 
                 # 1. Text Extraction
                 if use_native_text:
-                    loader = PyPDFLoader(tmp_file_path)
-                    docs = loader.load()
-                    for doc in docs:
-                        doc.metadata['source'] = uploaded_file.name
-                    documents.extend(docs)
+                    try:
+                        import pymupdf4llm
+                        from langchain_core.documents import Document
+                        
+                        md_chunks = pymupdf4llm.to_markdown(tmp_file_path, page_chunks=True)
+                        for chunk in md_chunks:
+                            # pymupdf4llm metadata uses 1-indexed 'page_number'
+                            # PyPDFLoader used 0-indexed 'page'. We convert to 0-indexed to preserve UI logic.
+                            page_idx = chunk["metadata"]["page_number"] - 1
+                            doc = Document(
+                                page_content=chunk["text"],
+                                metadata={
+                                    "source": uploaded_file.name,
+                                    "page": page_idx
+                                }
+                            )
+                            documents.append(doc)
+                    except ImportError:
+                        loader = PyPDFLoader(tmp_file_path)
+                        docs = loader.load()
+                        for doc in docs:
+                            doc.metadata['source'] = uploaded_file.name
+                        documents.extend(docs)
 
                 # 2. PDF Page Processing
                 pdf_document = fitz.open(tmp_file_path)
@@ -1294,7 +1401,7 @@ class SemanticCache:
             collection_metadata={"hnsw:space": "cosine"}
         )
 
-    def lookup(self, question, threshold=0.80):
+    def lookup(self, question, threshold=0.99):
         """
         Checks if a similar question exists in the cache.
         Returns (answer, distance, id) tuple.
@@ -1426,7 +1533,7 @@ def get_standalone_question(user_input, chat_history, llm_model_name):
     Uses an LLM to reformulate the user input into a standalone question
     based on the chat history.
     """
-    llm = ChatOllama(model=llm_model_name, temperature=0, base_url=OLLAMA_HOST)
+    llm = get_chat_model(llm_model_name, temperature=0)
     
     if not chat_history:
         return user_input
@@ -1487,6 +1594,49 @@ def get_standalone_question(user_input, chat_history, llm_model_name):
     except Exception as e:
         print(f"Error reformulating question: {e}")
         return user_input
+
+def enhance_prompt_with_ai(question, llm_model_name):
+    """
+    Uses an LLM to rewrite the user's query to make it highly optimized for vector search
+    and subsequent RAG generation.
+    """
+    llm = get_chat_model(llm_model_name, temperature=0.2)
+    
+    system_prompt = """You are an expert prompt engineer. Your task is to rewrite the user's question to make it optimal for a Retrieval-Augmented Generation (RAG) system.
+    
+    The output should be a single, clear, and highly descriptive question that:
+    1. Maximizes the likelihood of retrieving relevant documents from a vector database (include relevant keywords/synonyms).
+    2. Makes the final goal explicitly clear for the downstream LLM answering it.
+    
+    STRICT RULES:
+    1. Do NOT answer the question.
+    2. Return ONLY the enhanced question. No preamble, no explanation, no quotes.
+    3. Keep it as a single question.
+    """
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "{input}"),
+    ])
+    
+    chain = prompt | llm | StrOutputParser()
+    
+    try:
+        import re
+        enhanced_question = chain.invoke({"input": question})
+        # Clean up reasoning tags (e.g. from DeepSeek R1)
+        enhanced_question = re.sub(r'<think>.*?</think>', '', enhanced_question, flags=re.DOTALL).strip()
+        
+        # Sanity Checks
+        lower_q = enhanced_question.lower()
+        if lower_q.startswith("thinking...") or len(enhanced_question) > 500:
+            print(f"Debug: Enhanced prompt rejected (hallucination or too long). Falling back to input.")
+            return question
+            
+        return enhanced_question
+    except Exception as e:
+        print(f"Error enhancing prompt: {e}")
+        return question
 
 def get_retrieval_guard_thresholds(question):
     """
@@ -1632,7 +1782,7 @@ def get_rag_chain_standard(vectorstore, model_name, search_kwargs=None, use_rera
     Creates a standard RAG chain that takes a 'standalone_question' 
     and returns an answer.
     """
-    llm = ChatOllama(model=model_name, temperature=0.3, base_url=OLLAMA_HOST)
+    llm = get_chat_model(model_name, temperature=0.3)
     
     if search_kwargs is None:
         search_kwargs = {}
@@ -1673,22 +1823,29 @@ def get_rag_chain_standard(vectorstore, model_name, search_kwargs=None, use_rera
 
     st.session_state.reranker_status = reranker_status
     
-    qa_system_prompt = """You are a highly analytical expert assistant. Your task is to answer the user's question by deeply reasoning through the provided context.
+    if "gemma" in model_name.lower():
+        prefix = "<|think|>\n"
+        think_instruct = "2. The system has enabled your native thinking channel. You will automatically output your internal reasoning before arriving at the final answer."
+    else:
+        prefix = ""
+        think_instruct = '2. Before answering, you MUST "think out loud" about how the given facts relate to the user\'s question. You must place all of your thoughts and reasoning strictly inside <think> and </think> tags. AFTER the closing </think> tag, you MUST provide your final answer.'
+
+    qa_system_prompt = f"""{prefix}You are a highly analytical expert assistant. Your task is to answer the user's question by deeply reasoning through the provided context.
 
     DEEP THINKING INSTRUCTIONS:
     1. Read the provided context carefully. There may be multiple disjointed pieces of information that you must connect to form a cohesive answer.
-    2. Before answering, you MUST "think out loud" about how the given facts relate to the user's question. You must place all of your thoughts and reasoning inside <think> and </think> tags.
-    3. If the question requires inference, connect the dots logically based ONLY on the evidence provided inside your <think> tags. 
+    {think_instruct}
+    3. If the question requires inference, connect the dots logically based ONLY on the evidence provided inside your thinking block. 
     4. If the provided context simply does not contain enough information to deduce a complete answer, do NOT just say "I don't know". Instead, explain exactly what part of the question can be answered, and clearly state what specific information is missing from the context.
     
     IMPORTANT DETAILS:
-    - You must output your thinking process wrapped in <think>...</think> FIRST, before your final answer.
+    - You must output your thinking process FIRST, before your final answer.
     - You may receive descriptions of images as context. Treat these descriptions as factual observations of the visual content.
     - Answer the question comprehensively and thoughtfully, but do not hallucinate outside knowledge in your final answer.
     - Do NOT include "Time taken" or "Sources" in your answer. These are added automatically by the system.
     
     <context>
-    {context}
+    {{context}}
     </context>"""
     
     qa_prompt = ChatPromptTemplate.from_messages([
@@ -1750,8 +1907,9 @@ def evaluate_rag(query, response, contexts, eval_model_selection, embed_model_na
             
         else: # local
             from langchain_community.chat_models import ChatOllama
+
             local_model_name = eval_model_selection.split(":", 1)[1]
-            llm = ChatOllama(model=local_model_name, temperature=0, base_url=OLLAMA_HOST)
+            llm = get_chat_model(local_model_name, temperature=0)
 
         # Prepare dataset
         data = {
@@ -1832,8 +1990,9 @@ def agentic_evaluate_rag(query, response, contexts, eval_model_selection, google
         
     else: # local
         from langchain_community.chat_models import ChatOllama
+
         local_model_name = eval_model_selection.split(":", 1)[1]
-        llm = ChatOllama(model=local_model_name, temperature=0, base_url=OLLAMA_HOST)
+        llm = get_chat_model(local_model_name, temperature=0)
 
     eval_prompt = """
 You are an expert Teacher grading a Student's answer.
@@ -1918,7 +2077,8 @@ if DEEPEVAL_AVAILABLE:
             else:
                 local_model_name = eval_model_selection.split(":", 1)[1]
                 from langchain_community.chat_models import ChatOllama
-                self.llm = ChatOllama(model=local_model_name, temperature=0, base_url=OLLAMA_HOST)
+
+                self.llm = get_chat_model(local_model_name, temperature=0)
 
         def load_model(self):
             return self.llm
@@ -2106,8 +2266,12 @@ def main():
         st.session_state.chat_history = []
     if "vectorstore" not in st.session_state:
         st.session_state.vectorstore = None
+    if "openai_base_url" not in st.session_state:
+        st.session_state.openai_base_url = ""
+    if "openai_api_key" not in st.session_state:
+        st.session_state.openai_api_key = ""
     if "models" not in st.session_state:
-        st.session_state.models = get_ollama_models()
+        st.session_state.models = []
     if "embed_model" not in st.session_state:
         st.session_state.embed_model = ""
         
@@ -2139,6 +2303,8 @@ def main():
         st.session_state.use_reranker = False
     if "reranker_status" not in st.session_state:
         st.session_state.reranker_status = "disabled"
+    if "enhance_prompt" not in st.session_state:
+        st.session_state.enhance_prompt = False
 
     # User Data Directory
     user_data_dir = os.path.join("user_data", st.session_state.username)
@@ -2258,23 +2424,39 @@ def main():
 
         # Model Selection
         st.subheader("Model Configuration")
-        ollama_models = st.session_state.models if st.session_state.models else []
-        fixed_gemma4_model = resolve_available_model(
-            ollama_models,
-            ["gemma4"],
-            FIXED_GEMMA4_MODEL
-        )
-        selected_model = fixed_gemma4_model
-        selected_ocr_model = fixed_gemma4_model
-        selected_vlm_model = fixed_gemma4_model
+        
+        with st.expander("API Configuration", expanded=False):
+            openai_base_url_input = st.text_input("OpenAI Base URL", value=st.session_state.openai_base_url)
+            openai_api_key_input = st.text_input("OpenAI API Key", type="password", value=st.session_state.openai_api_key)
+            
+            if openai_base_url_input != st.session_state.openai_base_url or openai_api_key_input != st.session_state.openai_api_key:
+                st.session_state.openai_base_url = openai_base_url_input
+                st.session_state.openai_api_key = openai_api_key_input
+                # Refresh models
+                openai_models = fetch_openai_models(openai_base_url_input, openai_api_key_input)
+                ollama_models = get_ollama_models()
+                st.session_state.models = [f"[Ollama] {m}" for m in ollama_models] + [f"[OpenAI] {m}" for m in openai_models]
+                st.rerun()
 
-        st.info(
-            f"This app version uses a fixed Gemma4 pipeline for chat, OCR, and VLM: `{fixed_gemma4_model}`"
+        if not st.session_state.models:
+            openai_models = fetch_openai_models(st.session_state.openai_base_url, st.session_state.openai_api_key)
+            ollama_models = get_ollama_models()
+            st.session_state.models = [f"[Ollama] {m}" for m in ollama_models] + [f"[OpenAI] {m}" for m in openai_models]
+
+        all_models = st.session_state.models if st.session_state.models else []
+        fixed_gemma4_model = resolve_available_model(
+            all_models,
+            ["gemma4"],
+            f"[Ollama] {FIXED_GEMMA4_MODEL}"
         )
-        if not any("gemma4" in model.lower() for model in ollama_models):
+        selected_model = st.selectbox("Chat Model", all_models, index=all_models.index(fixed_gemma4_model) if fixed_gemma4_model in all_models else 0)
+        selected_ocr_model = st.selectbox("OCR Model", all_models, index=all_models.index(fixed_gemma4_model) if fixed_gemma4_model in all_models else 0)
+        selected_vlm_model = st.selectbox("VLM Model", all_models, index=all_models.index(fixed_gemma4_model) if fixed_gemma4_model in all_models else 0)
+
+        if not any("gemma4" in model.lower() for model in all_models):
             st.warning(
-                f"`{FIXED_GEMMA4_MODEL}` was not found in the currently discovered Ollama models. "
-                "The app will still target that model tag, so make sure it is installed locally."
+                f"`{FIXED_GEMMA4_MODEL}` was not found in the currently discovered models. "
+                "Make sure you select a valid model."
             )
         
         processing_mode = st.selectbox(
@@ -2286,14 +2468,14 @@ def main():
 
         # Embedding Model Selection
         resolved_nomic_model = resolve_available_model(
-            ollama_models,
+            all_models,
             ["nomic-embed-text"],
-            DEFAULT_NOMIC_EMBED_MODEL
+            f"[Ollama] {DEFAULT_NOMIC_EMBED_MODEL}"
         )
         # Dynamically find installed embedding models from Ollama
         dynamic_embeds = [
-            m for m in ollama_models 
-            if any(kw in m.lower() for kw in ["embed", "bge", "mxbai", "m3", "minilm"])
+            m for m in all_models 
+            if any(kw in m.lower() for kw in ["embed", "bge", "mxbai", "m3", "minilm", "qwen3", "glm", "kimi"])
         ]
         
         embed_models = []
@@ -2330,6 +2512,13 @@ def main():
         )
         st.session_state.use_reranker = use_reranker
         st.caption(f"Re-ranker status: `{st.session_state.reranker_status}`")
+        
+        enhance_prompt = st.checkbox(
+            "Enhance Prompt with AI",
+            value=st.session_state.enhance_prompt,
+            help="Uses the LLM to rewrite your question into an optimized search query and prompt before running the pipeline."
+        )
+        st.session_state.enhance_prompt = enhance_prompt
         
         # Load Persistent DB on Start if invalid
         if st.session_state.vectorstore is None and os.path.exists(db_path):
@@ -2865,6 +3054,10 @@ def main():
                 st.markdown(message.content)
         elif isinstance(message, AIMessage):
             with st.chat_message("assistant"):
+                enhanced_prompt = message.additional_kwargs.get("enhanced_prompt")
+                if enhanced_prompt:
+                    st.caption(f"✨ Enhanced Prompt: `{enhanced_prompt}`")
+                
                 content = message.content
                 system_footer = ""
                 # Strip out system-appended text to prevent it from being swallowed by greedy regex
@@ -2873,16 +3066,17 @@ def main():
                     content = parts[0]
                     system_footer = "\n\n**Time taken:**" + parts[1]
                     
-                if "<think>" in content:
-                    import re
+                import re
+                think_start_match = re.search(r'(<think>|<\|channel>thought\n?)', content)
+                if think_start_match:
                     # Close the thought block at ANY tag-like sequence
-                    match = re.search(r'<think>(.*?)(?:</?[a-zA-Z_:-][^>]*>|$)', content, flags=re.DOTALL)
+                    match = re.search(r'(?:<think>|<\|channel>thought\n?)(.*?)(?:</think>|<\|channel>answer|$)', content, flags=re.DOTALL)
                     if match:
                         think_text = match.group(1).strip()
                         answer_text = content[match.end():].strip()
                         
                         # Handle the case where the stream completely ended without emitting a closing tag
-                        if answer_text or re.search(r'</?[a-zA-Z_:-][^>]*>', content[match.end(1):]):
+                        if answer_text or re.search(r'(?:</think>|<\|channel>answer)', content[match.end(1):]):
                             with st.status("🤖 AI Thought Process", expanded=False, state="complete"):
                                 st.markdown(think_text)
                         else:
@@ -3097,6 +3291,7 @@ def main():
                         
                         # 0. Optimistic Lookup Check (Bypass reformulation drift for explicit Qs)
                         optimistic_hit = False
+                        enhanced_prompt_text = None
                         if is_tabular_query:
                             st.caption("Using deterministic tabular analysis for this question.")
                             query_trace.append({
@@ -3107,10 +3302,10 @@ def main():
                             # Skip cache when a @mention source filter is present:
                             # two queries like "summarize @doc1" and "summarize @doc2" produce
                             # the same clean_input after stripping, so they must not share a cache entry.
-                            cached_answer, cache_distance, cache_id = st.session_state.semantic_cache.lookup(clean_input, threshold=0.80)
+                            cached_answer, cache_distance, cache_id = st.session_state.semantic_cache.lookup(clean_input, threshold=0.99)
                             query_trace.append({
                                 "step": "semantic_cache_optimistic_lookup",
-                                "threshold": 0.80,
+                                "threshold": 0.99,
                                 "distance": cache_distance,
                                 "hit": bool(cached_answer),
                             })
@@ -3130,6 +3325,16 @@ def main():
                                 "standalone_question": standalone_question,
                             })
                             
+                            if st.session_state.enhance_prompt:
+                                enhanced_question = enhance_prompt_with_ai(standalone_question, selected_model)
+                                st.caption(f"✨ Enhanced Prompt: `{enhanced_question}`")
+                                standalone_question = enhanced_question
+                                enhanced_prompt_text = enhanced_question
+                                query_trace.append({
+                                    "step": "prompt_enhanced",
+                                    "enhanced_question": standalone_question,
+                                })
+                            
                             # 2. Check Cache (Normal)
                             if is_tabular_query:
                                 cached_answer = answer_tabular_analytics(standalone_question, st.session_state.tabular_data)
@@ -3139,10 +3344,10 @@ def main():
                                 })
                             elif st.session_state.semantic_cache and not has_document_tag:
                                 # Also skip cache for @mention source-filtered queries
-                                cached_answer, cache_distance, cache_id = st.session_state.semantic_cache.lookup(standalone_question, threshold=0.80)
+                                cached_answer, cache_distance, cache_id = st.session_state.semantic_cache.lookup(standalone_question, threshold=0.99)
                                 query_trace.append({
                                     "step": "semantic_cache_lookup",
-                                    "threshold": 0.80,
+                                    "threshold": 0.99,
                                     "distance": cache_distance,
                                     "hit": bool(cached_answer),
                                 })
@@ -3172,12 +3377,12 @@ def main():
                             # cached_answer, cached_contexts, cache_distance, cache_id = (
                             #     st.session_state.semantic_cache.lookup_with_context(
                             #         standalone_question,
-                            #         threshold=0.80
+                            #         threshold=0.99
                             #     )
                             # )
                             #
                             # if cached_answer and cached_contexts:
-                            #     llm = ChatOllama(model=selected_model, temperature=0.3, base_url=OLLAMA_HOST)
+                            #     llm = get_chat_model(selected_model, temperature=0.3)
                             #     qa_system_prompt = (
                             #         "You are an assistant for question-answering tasks. "
                             #         "Use the provided cached context to answer the current question. "
@@ -3256,6 +3461,7 @@ def main():
                                     "question": user_input,
                                     "contexts": [],
                                     "model": selected_model,
+                                    "enhanced_prompt": enhanced_prompt_text
                                 }
                             ))
                             # Save Button Logic (for cached response)
@@ -3373,15 +3579,17 @@ def main():
                                             text_chunk = chunk["answer"]
                                             full_answer += text_chunk
                                             
-                                            if "<think>" in full_answer:
+                                            import re
+                                            think_start_match = re.search(r'(<think>|<\|channel>thought\n?)', full_answer)
+                                            if think_start_match:
                                                 has_thought_trace = True
-                                                start_idx = full_answer.find("<think>") + 7
+                                                start_idx = think_start_match.end()
                                                 
                                                 if not thought_rendered:
                                                     import re
                                                     thought_so_far = full_answer[start_idx:]
                                                     # Extremely flexible XML tag catcher
-                                                    match = re.search(r'</?[a-zA-Z_:-][^>]*>', thought_so_far)
+                                                    match = re.search(r'(?:</think>|<\|channel>answer)', thought_so_far)
                                                     
                                                     if match:
                                                         thought_end_offset = match.start()
@@ -3421,8 +3629,8 @@ def main():
                                         if not thought_rendered:
                                             # Edge case: It started thinking but never closed the tag before stream ended
                                             thought_expander.update(label="🤖 AI Thought Process (Incomplete)", expanded=False, state="complete")
-                                            # Nothing visible to print safely because we don't know where the thought ends
-                                            final_visible_text = ""
+                                            # We don't know where the thought ends, so we show a helpful fallback message
+                                            final_visible_text = "*(The AI placed its final answer inside its internal thought trace. Please expand the '🤖 AI Thought Process (Incomplete)' block above to read it.)*"
                                         else:
                                             final_visible_text = full_answer[thought_end_idx:].strip()
                                             
@@ -3439,10 +3647,15 @@ def main():
                             else:
                                 st.caption("📸 Using Temporary Image Context (Direct Mode)")
                                 # Use a simple chain
-                                llm = ChatOllama(model=selected_model, temperature=0.7, base_url=OLLAMA_HOST)
+                                llm = get_chat_model(selected_model, temperature=0.7)
                                 # Simple prompt that includes history implicitly via standalone_question
+                                if "gemma" in selected_model.lower():
+                                    sys_prompt = "<|think|>\nYou are a helpful assistant. Answer the user's question in detail.\n\nFormatting requirement:\n{response_style}"
+                                else:
+                                    sys_prompt = "You are a helpful assistant. Answer the user's question in detail.\n\nFormatting requirement:\n{response_style}"
+                                
                                 prompt = ChatPromptTemplate.from_messages([
-                                    ("system", "You are a helpful assistant. Answer the user's question in detail.\n\nFormatting requirement:\n{response_style}"),
+                                    ("system", sys_prompt),
                                     ("human", "{input}"),
                                 ])
                                 chain = prompt | llm | StrOutputParser()
@@ -3462,14 +3675,16 @@ def main():
                                 }):
                                     full_answer += chunk
                                     
-                                    if "<think>" in full_answer:
+                                    import re
+                                    think_start_match = re.search(r'(<think>|<\|channel>thought\n?)', full_answer)
+                                    if think_start_match:
                                         has_thought_trace = True
-                                        start_idx = full_answer.find("<think>") + 7
+                                        start_idx = think_start_match.end()
                                         
                                         if not thought_rendered:
                                             import re
                                             thought_so_far = full_answer[start_idx:]
-                                            match = re.search(r'</?[a-zA-Z_:-][^>]*>', thought_so_far)
+                                            match = re.search(r'(?:</think>|<\|channel>answer)', thought_so_far)
                                             
                                             if match:
                                                 thought_end_offset = match.start()
@@ -3501,7 +3716,7 @@ def main():
                                 else:
                                     if not thought_rendered:
                                         thought_expander.update(label="🤖 AI Thought Process (Incomplete)", expanded=False, state="complete")
-                                        final_visible_text = ""
+                                        final_visible_text = "*(The AI placed its final answer inside its internal thought trace. Please expand the '🤖 AI Thought Process (Incomplete)' block above to read it.)*"
                                     else:
                                         final_visible_text = full_answer[thought_end_idx:].strip()
                                         
@@ -3721,6 +3936,7 @@ def main():
                                     "question": user_input,
                                     "contexts": context_text if 'context_text' in locals() else [],
                                     "model": selected_model,
+                                    "enhanced_prompt": enhanced_prompt_text
                                 }
                             ))
                             
